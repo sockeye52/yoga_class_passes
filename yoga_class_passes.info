@@ -1,0 +1,11 @@
+name = Yoga Class Passes
+description = Manages yoga class passes
+core = 7.x
+package = Yoga Broward
+[dependencies] = views
+[dependencies] = date
+[dependencies] = yoga_class_register
+[dependencies] = yoga_display_customizations
+[dependencies] = yoga_display_attendance
+[dependencies] = yogabroward_pp_ipn
+[dependencies] = webform

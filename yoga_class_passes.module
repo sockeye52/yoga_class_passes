@@ -1,0 +1,308 @@
+<?php
+
+/**
+ * @file
+ * This module supports the checkout process prior to implementing the Yoga Commerce module.
+ * It can go away once the Yoga Commerce module is implemented.
+ */
+
+/**
+ * *
+ * * implement hook_node_load()
+ * *
+ */
+function yoga_class_passes_node_load($nodes, $types) {
+  $this_node = array_key_first($nodes);
+  $this_type = array_key_first($types);
+  if (
+    $nodes[$this_node]->title == "Offline Purchase" && $nodes[$this_node]->type == "webform"
+    && isset($_GET['item']) && isset($_GET['amount'])
+  ) {
+    foreach ($nodes[$this_node]->webform["components"] as $key => $value) {
+      if ($nodes[$this_node]->webform["components"][$key]['value'] == "DEFAULT_ITEM_PURCHASED") {
+        $nodes[$this_node]->webform["components"][$key]['value'] = $_GET['item'];
+      }
+      elseif ($nodes[$this_node]->webform["components"][$key]['value'] == "DEFAULT_ITEM_PRICE") {
+        $nodes[$this_node]->webform["components"][$key]['value'] = "$" . $_GET['amount'];
+      }
+    }
+  }
+}
+
+/**
+ * Implement hook_node_view()
+ */
+function yoga_class_passes_node_view($node, $view_mode, $langcode) {
+  // For offer nodes being viewed through Checkout View.
+  if ($view_mode == 'checkout') {
+    $node->content['field_title'] = [
+      "#markup" => "<h2>$node->title</h2>",
+      "#weight" => -1,
+    ];
+    $pp_client_id = variable_get('yogabroward_pp_ipn_api_client_id');
+    $pp_src_options = "&currency=USD&disable-funding=credit,paylater";
+    $offer_type = taxonomy_term_load($node->field_offer_type_taxonomy['und'][0]['tid'])->name;
+    if ($offer_type == "Subscription") {
+      $pp_src_options = "&vault=true&intent=subscription&disable-funding=credit";
+      $node->content['field_price'][0]["#markup"] .= ' per month, Auto-pay';
+      $tokens = ["{SUBSCRIPTION}", "{SUBSCRIPTION_NAME}", "{PRICE}"];
+      $values = [$node->field_subscription_plan_id['und'][0]['safe_value'], $node->title, $node->content['field_price'][0]["#markup"]];
+    }
+    else {
+      $tokens = ["{AMOUNT}", "{DESCRIPTION}"];
+      $values = [$node->field_price['und'][0]['value'], htmlspecialchars($node->title)];
+      $node->content["field_offline_purchase"] = [
+        "#markup" => yoga_class_passes_offline($tokens, $values),
+        "#weight" => $node->content["field_price"]["#weight"] + 2,
+      ];
+    }
+    $node->content["field_checkout_script"] = [
+      "#markup" => yoga_class_passes_script($offer_type, $tokens, $values),
+      "#weight" => $node->content["field_price"]["#weight"] + 1,
+    ];
+    $script_src = "https://www.paypal.com/sdk/js?client-id=$pp_client_id$pp_src_options";
+    drupal_add_js($script_src, 'external');
+  }
+}
+
+/**
+ * Returns the appropriate PayPal button script for the item that is being purchased.
+ */
+function yoga_class_passes_script($type, $tokens, $values) {
+  global $base_url;
+  if ($type == "Subscription") {
+    $script = '</script>
+    <div id="paypal-button-container"></div>
+    <script>
+      paypal.Buttons({
+        style: {
+          label: "subscribe",
+        },
+        createSubscription: function(data, actions) {
+          return actions.subscription.create({
+            "plan_id": "{SUBSCRIPTION}", // Creates the subscription
+            application_context: {
+              shipping_preference: "NO_SHIPPING"
+            }
+          });
+        },
+        onApprove: function(data, actions) {
+          data["subscription_name"] = "{SUBSCRIPTION_NAME}";
+          data["subscription_price"] = "{PRICE}";
+          console.log("Capture result", data, JSON.stringify(data, null, 2));
+          // alert("You have successfully created subscription " + data.subscriptionID); // Optional message given to subscriber
+          PostObjectToUri("' . $base_url . '/purchase-confirmation", data);
+        }
+      }).render("#paypal-button-container"); // Renders the PayPal button
+      function PostObjectToUri(uri, obj) {
+        "use strict";
+
+        var json, form, input;
+
+        json = JSON.stringify(obj);
+
+        form = document.createElement("form");
+        form.method = "post";
+        form.action = uri;
+        input = document.createElement("input");
+        input.setAttribute("name", "json");
+        input.setAttribute("value", json);
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+      };
+    </script>
+';
+  }
+  else {
+    $script = '<div id="paypal-button-container"></div>
+  <script>
+    paypal.Buttons({
+      createOrder: function(data, actions) {
+        return actions.order.create({
+          purchase_units: [{
+            amount: {
+              value: "{AMOUNT}"
+            },
+            description: "{DESCRIPTION}"
+          }],
+          application_context: {
+              shipping_preference: "NO_SHIPPING"
+          }
+        });
+      },
+
+      // Finalize the transaction after payer approval
+      onApprove: function(data, actions) {
+        return actions.order.capture().then(function(orderData) {
+          // Successful capture! For dev/demo purposes:
+          console.log("Capture result", orderData, JSON.stringify(orderData, null, 2));
+          var transaction = orderData.purchase_units[0].payments.captures[0];
+          // alert("Transaction " + transaction.status + ": " + transaction.id + "\n\nSee console for all available details");
+
+          // When ready to go live, remove the alert and show a success message within this page. For example:
+          // var element = document.getElementById("paypal-button-container");
+          // element.innerHTML = "";
+          // element.innerHTML = "<h3>Thank you for your payment!</h3>";
+          var queryString = "txn_id=" + orderData["id"];
+          queryString += "&first_name=" + orderData["payer"]["name"]["given_name"];
+          queryString += "&last_name=" + orderData["payer"]["name"]["surname"];
+          queryString += "&item_name=" + orderData["purchase_units"][0]["description"];
+          queryString += "&payment_gross=" + orderData["purchase_units"][0]["amount"]["value"];
+          queryString += "&payment_status=" + orderData["status"];
+          queryString += "&payer_email=" + orderData["payer"]["email_address"];
+          queryString += "&receiver_email=" + orderData["payer"]["email_address"];
+          var targetURL = encodeURI("' . $base_url . '/purchase-confirmation?" + queryString);
+          PostObjectToUri("' . $base_url . '/purchase-confirmation", orderData);
+        });
+      }
+      }).render("#paypal-button-container");
+      function PostObjectToUri(uri, obj) {
+        "use strict";
+
+        var json, form, input;
+
+        json = JSON.stringify(obj);
+
+        form = document.createElement("form");
+        form.method = "post";
+        form.action = uri;
+        input = document.createElement("input");
+        input.setAttribute("name", "json");
+        input.setAttribute("value", json);
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+      };
+  </script>
+  ';
+  }
+  watchdog("yoga_class_passes", "$type Script: !script", ["!script" => "<pre>" . print_r(str_replace($tokens, $values, $script), TRUE) . "</pre>"]);
+  return str_replace($tokens, $values, $script);
+}
+
+/**
+ *
+ */
+function yoga_class_passes_offline($tokens, $values) {
+  $markup = '<div>You may also purchase via <a href="/offline-purchase?item={DESCRIPTION}&amount={AMOUNT}">Zelle, check or cash</a>.';
+  return str_replace($tokens, $values, $markup);
+}
+
+/**
+ * Implement hook_webform_submission_insert()
+ */
+function yoga_class_passes_webform_submission_insert($node, $submission) {
+  // dpm($node);
+  // dpm($submission);
+  $offer_types_allowed = ["Gift Certificate", "Payment"];
+
+  if (in_array("Offer Type", array_column($node->webform['components'], 'name'))) {
+
+    // Create array of submitted webform values.
+    $submitted = [];
+
+    foreach ($node->webform['components'] as $key => $value) {
+      $submitted[$value['name']] = $submission->data[$key][0];
+    }
+    // dpm($submitted);
+    if (!isset($submitted["Offer Type"]) || !in_array($submitted["Offer Type"], $offer_types_allowed)) {
+      // dpm("OFFER TYPE NOT FOUND: " . $submitted['Offer Type']);.
+      return;
+    }
+
+    // dpm("FOUND OFFER TYPE: " . $submitted['Offer Type']);.
+    $offer_search = taxonomy_get_term_by_name($submitted["Offer Type"]);
+    // dpm($offer_search);
+    $offer_type_tid = array_key_first($offer_search);
+    // dpm("OFFER TYPE TID: $offer_type_tid");.
+    $submitted['offer_type_tid'] = $offer_type_tid;
+    // Create offer.
+    $new_offer = yoga_class_passes_create_offer($submitted);
+    // return; //temp
+    // Send emails and go to checkout page.
+    webform_submission_send_mail($node, $submission);
+    drupal_goto("yoga-checkout/$new_offer->nid");
+  }
+}
+
+/**
+ * Create offer node based on webform submission.
+ */
+function yoga_class_passes_create_offer(array $submitted) {
+  global $user;
+
+  // Load the webform submission
+  // entity_create replaces the procedural steps in the first example of
+  // creating a new object $node and setting its 'type' and uid property.
+  $values = [
+    'type' => 'offer',
+    'uid' => 1,
+    'status' => 1,
+    'comment' => 0,
+    'promote' => 0,
+  ];
+  $entity = entity_create('node', $values);
+
+  // The entity is now created, but we have not yet simplified use of it.
+  // Now create an entity_metadata_wrapper around the new node entity
+  // to make getting and setting values easier.
+  $ewrapper = entity_metadata_wrapper('node', $entity);
+
+  // Using the wrapper, we do not have to worry about telling Drupal
+  // what language we are using. The Entity API handles that for us.
+  $ewrapper->title->set($submitted["Offer Type"]);
+  $ewrapper->field_price->set($submitted[$submitted["Offer Type"] . " Amount"]);
+
+  $ewrapper->field_hidden->set(1);
+
+  // Setting the body is a bit different from other properties or fields
+  // because the body can have both its complete value and its
+  // summary.
+  $my_body_content = yoga_class_passes_offer_body($submitted);
+  $ewrapper->body->set(['value' => $my_body_content, 'format' => 'full_html']);
+  $ewrapper->body->raw();
+  // $ewrapper->body->summary->set('Things that interest me');
+  // Setting the value of an entity reference field only requires passing
+  // the entity id (e.g., nid) of the entity to which you want to refer
+  // The nid 15 here is just an example.
+  // $ref_nid = 15;.
+  // Note that the entity id (e.g., nid) must be passed as an integer not a
+  // string.
+  $ewrapper->field_offer_type_taxonomy->set(intval($submitted['offer_type_tid']));
+
+  // Entity API cannot set date field values so the 'old' method must
+  // be used
+  // $my_date = new DateTime('January 1, 2013');
+  // $entity->field_my_date[LANGUAGE_NONE][0] = array(
+  //  'value' => date_format($my_date, 'Y-m-d'),
+  //  'timezone' => 'UTC',
+  //  'timezone_db' => 'UTC',
+  // );
+  // Now just save the wrapper and the entity
+  // There is some suggestion that the 'true' argument is necessary to
+  // the entity save method to circumvent a bug in Entity API. If there is
+  // such a bug, it almost certainly will get fixed, so make sure to check.
+  $ewrapper->save();
+
+  // dpm($entity);
+  return $entity;
+}
+
+/**
+ * Create offer Body appropriate for Offer Type.
+ */
+function yoga_class_passes_offer_body(array $submitted) {
+  $output = "";
+
+  // dpm("BODY: OFFER TYPE = " . $submitted['Offer Type']);.
+  $do_not_show = ["Offer Type", "offer_type_tid", "Payment Amount", "Gift Certificate Amount"];
+  $output = '<table class="offer_table">';
+  foreach ($submitted as $key => $value) {
+    if (!in_array($key, $do_not_show)) {
+      $output .= '<tr><td>' . $key . '</td><td>' . $value . '</td></tr>';
+    }
+  }
+  $output .= '</table>';
+  return $output;
+}
